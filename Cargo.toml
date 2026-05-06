@@ -1,0 +1,6 @@
+[package]
+name = "asmap"
+version = "0.1.0"
+edition = "2021"
+description = "IP to ASN lookup using Bitcoin Core's asmap binary trie format"
+license = "MIT"
