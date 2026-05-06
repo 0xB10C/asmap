@@ -52,6 +52,7 @@ impl From<std::io::Error> for AsmapError {
 /// let asn = map.lookup("8.8.8.8".parse::<IpAddr>().unwrap());
 /// println!("ASN: {asn}");
 /// ```
+#[derive(Debug)]
 pub struct Asmap {
     data: Vec<u8>,
 }

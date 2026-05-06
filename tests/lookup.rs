@@ -1,6 +1,6 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use asmap::Asmap;
+use asmap::{Asmap, AsmapError};
 
 fn load_fixture() -> Asmap {
     Asmap::from_file("fixtures/asmap.raw").expect("failed to load fixtures/asmap.raw")
@@ -68,4 +68,83 @@ fn lookup_unmapped_returns_zero() {
     // 127.0.0.1 is unlikely to be mapped in a test asmap
     let asn = map.lookup_v4(Ipv4Addr::new(127, 0, 0, 1));
     assert_eq!(asn, 0, "unmapped address should return ASN 0");
+}
+
+#[test]
+fn lookup_v6_mapped_ipv4() {
+    let map = load_fixture();
+    // ::ffff:250.0.0.1 is the IPv6-mapped form of 250.0.0.1
+    let addr = Ipv4Addr::new(250, 0, 0, 1).to_ipv6_mapped();
+    assert_eq!(map.lookup_v6(addr), 1000);
+}
+
+#[test]
+fn lookup_v6_native() {
+    let map = load_fixture();
+    // Pure IPv6 address — likely unmapped in this fixture
+    let addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    let asn = map.lookup_v6(addr);
+    // Just verify it doesn't panic; result depends on fixture contents
+    let _ = asn;
+}
+
+#[test]
+fn as_bytes_matches_file() {
+    let raw = std::fs::read("fixtures/asmap.raw").unwrap();
+    let map = Asmap::from_bytes(raw.clone()).unwrap();
+    assert_eq!(map.as_bytes(), &raw[..]);
+}
+
+#[test]
+fn error_display_invalid() {
+    let err = Asmap::from_bytes(vec![0x00]).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("validation"), "got: {msg}");
+}
+
+#[test]
+fn error_display_io() {
+    let err = Asmap::from_file("/nonexistent/path/asmap.raw").unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("read asmap file"), "got: {msg}");
+    // Also test Error::source()
+    let source = std::error::Error::source(&err);
+    assert!(source.is_some());
+}
+
+#[test]
+fn error_from_io() {
+    let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+    let asmap_err: AsmapError = io_err.into();
+    let msg = format!("{asmap_err}");
+    assert!(msg.contains("gone"));
+}
+
+#[test]
+fn validation_rejects_corrupted_first_byte() {
+    let mut data = std::fs::read("fixtures/asmap.raw").unwrap();
+    data[0] ^= 0xFF;
+    assert!(Asmap::from_bytes(data).is_err());
+}
+
+#[test]
+fn validation_rejects_corrupted_middle() {
+    let mut data = std::fs::read("fixtures/asmap.raw").unwrap();
+    let mid = data.len() / 2;
+    data[mid] ^= 0xFF;
+    assert!(Asmap::from_bytes(data).is_err());
+}
+
+#[test]
+fn validation_rejects_appended_bytes() {
+    let mut data = std::fs::read("fixtures/asmap.raw").unwrap();
+    data.extend_from_slice(&[0xFF; 16]);
+    assert!(Asmap::from_bytes(data).is_err());
+}
+
+#[test]
+fn validation_rejects_single_byte() {
+    assert!(Asmap::from_bytes(vec![0x00]).is_err());
+    assert!(Asmap::from_bytes(vec![0x01]).is_err());
+    assert!(Asmap::from_bytes(vec![0x80]).is_err());
 }
