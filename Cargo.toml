@@ -11,3 +11,10 @@ readme = "README.md"
 keywords = ["asn", "ip", "asmap", "autonomous-system", "bitcoin"]
 categories = ["network-programming"]
 exclude = ["fixtures/", "flake.nix", "flake.lock"]
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "lookup"
+harness = false
