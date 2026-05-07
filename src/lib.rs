@@ -55,6 +55,8 @@ impl From<std::io::Error> for AsmapError {
 #[derive(Debug)]
 pub struct Asmap {
     data: Vec<u8>,
+    /// Length of the actual asmap data (excluding the 7-byte read padding).
+    len: usize,
 }
 
 impl Asmap {
@@ -65,11 +67,15 @@ impl Asmap {
     }
 
     /// Validate and wrap raw asmap bytes.
-    pub fn from_bytes(data: Vec<u8>) -> Result<Self, AsmapError> {
+    pub fn from_bytes(mut data: Vec<u8>) -> Result<Self, AsmapError> {
         if !validate::sanity_check(&data, 128) {
             return Err(AsmapError::Invalid);
         }
-        Ok(Asmap { data })
+        let len = data.len();
+        // Pad with 7 zero bytes so the interpreter can always do aligned u64 loads
+        // without bounds checking near the end of the data.
+        data.extend_from_slice(&[0u8; 7]);
+        Ok(Asmap { data, len })
     }
 
     /// Look up the ASN for an IP address. Returns 0 if unmapped.
@@ -91,8 +97,8 @@ impl Asmap {
         self.lookup(IpAddr::V6(addr))
     }
 
-    /// Returns the raw asmap data.
+    /// Returns the raw asmap data (without internal padding).
     pub fn as_bytes(&self) -> &[u8] {
-        &self.data
+        &self.data[..self.len]
     }
 }
