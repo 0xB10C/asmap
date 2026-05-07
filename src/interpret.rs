@@ -1,45 +1,33 @@
-const INVALID: u32 = 0xFFFFFFFF;
-
-/// Extract a single bit from a byte slice using little-endian bit ordering (LSB first).
-/// Used for reading asmap bytecode.
-#[inline]
-fn consume_bit_le(bitpos: &mut usize, bytes: &[u8]) -> bool {
-    let bit = (bytes[*bitpos / 8] >> (*bitpos % 8)) & 1;
-    *bitpos += 1;
-    bit != 0
+/// Read up to 32 bits from a byte slice starting at a bit position (LE bit order).
+/// Returns the bits as a u32 in the low positions. Assumes sufficient data exists.
+#[inline(always)]
+fn read_bits_le(bitpos: usize, data: &[u8], count: u8) -> u32 {
+    if count == 0 {
+        return 0;
+    }
+    let byte_offset = bitpos / 8;
+    let bit_offset = bitpos % 8;
+    // Read up to 5 bytes to cover any bit-unaligned 32-bit span
+    let mut raw: u64 = 0;
+    let bytes_needed = (bit_offset + count as usize).div_ceil(8);
+    for i in 0..bytes_needed {
+        raw |= (data[byte_offset + i] as u64) << (i * 8);
+    }
+    ((raw >> bit_offset) & ((1u64 << count) - 1)) as u32
 }
 
-/// Extract a single bit from a byte slice using big-endian bit ordering (MSB first).
-/// Used for reading IP address bits in network byte order.
-#[inline]
-fn consume_bit_be(bitpos: &mut u8, bytes: &[u8]) -> bool {
-    let bit = (bytes[*bitpos as usize / 8] >> (7 - (*bitpos as usize % 8))) & 1;
-    *bitpos += 1;
-    bit != 0
-}
-
-/// Variable-length integer decoder.
-///
-/// Numbers are encoded in classes of increasing bit widths. Each class is prefixed
-/// by continuation bits (1 = next class, 0 = decode value in current class).
-/// The last class has no continuation bit.
-///
-/// Example with minval=100, bit_sizes=[4,2,2,3]:
-///   - [100..115]: [0] + 4-bit BE value
-///   - [116..119]: [1,0] + 2-bit BE value
-///   - [120..123]: [1,1,0] + 2-bit BE value
-///   - [124..131]: [1,1,1] + 3-bit BE value
-fn decode_bits(bitpos: &mut usize, data: &[u8], minval: u32, bit_sizes: &[u8]) -> u32 {
-    let end_bits = data.len() * 8;
+/// Decode a variable-length integer from the asmap bytecode.
+/// Since data is pre-validated, no bounds checking is performed.
+#[inline(always)]
+fn decode_bits(pos: &mut usize, data: &[u8], minval: u32, bit_sizes: &[u8]) -> u32 {
     let mut val = minval;
 
     for (i, &size) in bit_sizes.iter().enumerate() {
         let is_last = i + 1 == bit_sizes.len();
         let bit = if !is_last {
-            if *bitpos >= end_bits {
-                return INVALID;
-            }
-            consume_bit_le(bitpos, data)
+            let b = read_bits_le(*pos, data, 1) != 0;
+            *pos += 1;
+            b
         } else {
             false
         };
@@ -47,22 +35,19 @@ fn decode_bits(bitpos: &mut usize, data: &[u8], minval: u32, bit_sizes: &[u8]) -
         if bit {
             val += 1 << size;
         } else {
-            for b in 0..size {
-                if *bitpos >= end_bits {
-                    return INVALID;
-                }
-                if consume_bit_le(bitpos, data) {
-                    val += 1 << (size - 1 - b);
-                }
-            }
+            // Read `size` bits at once and reverse their bit order (stored BE within class)
+            let raw = read_bits_le(*pos, data, size);
+            *pos += size as usize;
+            // The bits are stored big-endian within the class value
+            val += raw.reverse_bits() >> (32 - size);
             return val;
         }
     }
-    INVALID
+    unreachable!()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
+#[repr(u8)]
 enum Instruction {
     Return = 0,
     Jump = 1,
@@ -70,7 +55,6 @@ enum Instruction {
     Default = 3,
 }
 
-const TYPE_BIT_SIZES: &[u8] = &[0, 0, 1];
 const ASN_BIT_SIZES: &[u8] = &[15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
 const MATCH_BIT_SIZES: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
 const JUMP_BIT_SIZES: &[u8] = &[
@@ -78,26 +62,40 @@ const JUMP_BIT_SIZES: &[u8] = &[
     30,
 ];
 
-fn decode_type(bitpos: &mut usize, data: &[u8]) -> Option<Instruction> {
-    match decode_bits(bitpos, data, 0, TYPE_BIT_SIZES) {
-        0 => Some(Instruction::Return),
-        1 => Some(Instruction::Jump),
-        2 => Some(Instruction::Match),
-        3 => Some(Instruction::Default),
-        _ => None,
+/// Decode instruction type directly from 1-3 bits:
+///   0 = RETURN, 10 = JUMP, 110 = MATCH, 111 = DEFAULT
+#[inline(always)]
+fn decode_type(pos: &mut usize, data: &[u8]) -> Instruction {
+    if read_bits_le(*pos, data, 1) == 0 {
+        *pos += 1;
+        Instruction::Return
+    } else if read_bits_le(*pos + 1, data, 1) == 0 {
+        *pos += 2;
+        Instruction::Jump
+    } else {
+        let third = read_bits_le(*pos + 2, data, 1);
+        *pos += 3;
+        if third == 0 {
+            Instruction::Match
+        } else {
+            Instruction::Default
+        }
     }
 }
 
-fn decode_asn(bitpos: &mut usize, data: &[u8]) -> u32 {
-    decode_bits(bitpos, data, 1, ASN_BIT_SIZES)
+#[inline(always)]
+fn decode_asn(pos: &mut usize, data: &[u8]) -> u32 {
+    decode_bits(pos, data, 1, ASN_BIT_SIZES)
 }
 
-fn decode_match(bitpos: &mut usize, data: &[u8]) -> u32 {
-    decode_bits(bitpos, data, 2, MATCH_BIT_SIZES)
+#[inline(always)]
+fn decode_match(pos: &mut usize, data: &[u8]) -> u32 {
+    decode_bits(pos, data, 2, MATCH_BIT_SIZES)
 }
 
-fn decode_jump(bitpos: &mut usize, data: &[u8]) -> u32 {
-    decode_bits(bitpos, data, 17, JUMP_BIT_SIZES)
+#[inline(always)]
+fn decode_jump(pos: &mut usize, data: &[u8]) -> u32 {
+    decode_bits(pos, data, 17, JUMP_BIT_SIZES)
 }
 
 /// Interpret asmap bytecode to find the ASN for a 128-bit (IPv6) address.
@@ -106,64 +104,43 @@ fn decode_jump(bitpos: &mut usize, data: &[u8]) -> u32 {
 /// (callers must validate with `sanity_check` first).
 pub(crate) fn interpret(asmap: &[u8], ip: &[u8; 16]) -> u32 {
     let mut pos: usize = 0;
-    let endpos = asmap.len() * 8;
-    let mut ip_bit: u8 = 0;
-    let ip_bits_end: u8 = 128;
     let mut default_asn: u32 = 0;
 
-    while pos < endpos {
-        let Some(opcode) = decode_type(&mut pos, asmap) else {
-            break;
-        };
+    // Convert IP to u128 for fast bit extraction
+    let ip_val = u128::from_be_bytes(*ip);
+    let mut ip_bit: u8 = 0;
+
+    loop {
+        let opcode = decode_type(&mut pos, asmap);
 
         match opcode {
             Instruction::Return => {
-                let asn = decode_asn(&mut pos, asmap);
-                if asn == INVALID {
-                    break;
-                }
-                return asn;
+                return decode_asn(&mut pos, asmap);
             }
             Instruction::Jump => {
                 let jump = decode_jump(&mut pos, asmap);
-                if jump == INVALID {
-                    break;
-                }
-                if ip_bit == ip_bits_end {
-                    break;
-                }
-                if jump as i64 >= (endpos - pos) as i64 {
-                    break;
-                }
-                if consume_bit_be(&mut ip_bit, ip) {
+                // Extract next IP bit (big-endian: MSB first)
+                if (ip_val >> (127 - ip_bit as u32)) & 1 == 1 {
                     pos += jump as usize;
                 }
+                ip_bit += 1;
             }
             Instruction::Match => {
                 let match_val = decode_match(&mut pos, asmap);
-                if match_val == INVALID {
-                    break;
-                }
-                let matchlen = (32 - match_val.leading_zeros()) as u8 - 1;
-                if (ip_bits_end - ip_bit) < matchlen {
-                    break;
-                }
+                let matchlen = (32 - match_val.leading_zeros()) - 1;
+                // Compare IP bits against the match pattern
                 for bit in 0..matchlen {
-                    if consume_bit_be(&mut ip_bit, ip)
-                        != ((match_val >> (matchlen - 1 - bit)) & 1 != 0)
-                    {
+                    let ip_b = (ip_val >> (127 - ip_bit as u32)) & 1;
+                    let pat_b = (match_val >> (matchlen - 1 - bit)) & 1;
+                    if ip_b != pat_b as u128 {
                         return default_asn;
                     }
+                    ip_bit += 1;
                 }
             }
             Instruction::Default => {
                 default_asn = decode_asn(&mut pos, asmap);
-                if default_asn == INVALID {
-                    break;
-                }
             }
         }
     }
-
-    panic!("asmap interpretation reached EOF without RETURN — data should have been validated");
 }
